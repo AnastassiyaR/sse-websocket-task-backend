@@ -1,93 +1,262 @@
-# Task2
+# ITI0302-2025 Demo: WebSockets & SSE Chat
 
+## Overview
 
+This project is a **Spring Boot demo** showing real-time communication:
 
-## Getting started
+* **SSE (Server-Sent Events)** – backend sends time updates to the frontend every 5 seconds.
+* **WebSocket (STOMP)** – simple chat where users send and receive messages instantly.
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+It is **unauthenticated**, focusing on **demonstrating SSE and WebSocket concepts**.
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+---
 
-## Add your files
+## Structure
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
+### 1. Configuration (`config`)
 
+#### a) **SseScheduler.java** – scheduled SSE updates
+
+* Sends the current server time to all connected clients every 5 seconds.
+* Uses `@Scheduled(fixedRate = 5000)` to trigger the update.
+* Logs the number of active clients.
+
+```java
+@Slf4j
+@Component
+@EnableScheduling
+@RequiredArgsConstructor
+public class SseScheduler {
+
+    private final SseService sseService;
+
+    @Scheduled(fixedRate = 5000)
+    public void sendPeriodicUpdates() {
+        log.info("Sending periodic time update to {} clients",
+                sseService.getActiveEmittersCount());
+        sseService.sendTimeUpdate();
+    }
+}
 ```
-cd existing_repo
-git remote add origin https://gitlab.cs.taltech.ee/anrozk/task2.git
-git branch -M main
-git push -uf origin main
+
+**Why it’s important:** Shows automatic backend-to-frontend push without client requests.
+
+#### b) **WebSocketConfig.java** – WebSocket setup
+
+* Configures STOMP endpoints and message broker.
+* `/ws` is the endpoint clients connect to (with SockJS fallback).
+* `/app/...` for incoming messages, `/topic/...` for broadcasting.
+
+```java
+@Configuration
+@EnableWebSocketMessageBroker
+public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
+
+    @Override
+    public void configureMessageBroker(MessageBrokerRegistry config) {
+        config.enableSimpleBroker("/topic");
+        config.setApplicationDestinationPrefixes("/app");
+    }
+
+    @Override
+    public void registerStompEndpoints(StompEndpointRegistry registry) {
+        registry.addEndpoint("/ws")
+                .setAllowedOriginPatterns("*")
+                .withSockJS();
+    }
+}
 ```
 
-## Integrate with your tools
+**Why it’s important:** Establishes the backbone for real-time chat communication.
 
-- [ ] [Set up project integrations](https://gitlab.cs.taltech.ee/anrozk/task2/-/settings/integrations)
+### 2. Controllers (`controller`)
 
-## Collaborate with your team
+#### a) **SseController.java** – SSE endpoint
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
+* Provides `/api/sse` endpoint for clients to connect.
+* Returns a new `SseEmitter` for each client.
 
-## Test and Deploy
+```java
+@RestController
+@AllArgsConstructor
+public class SseController {
 
-Use the built-in continuous integration in GitLab.
+    private final SseService sseService;
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+    @GetMapping(path = "/api/sse", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter stream() {
+        return sseService.createEmitter();
+    }
+}
+```
 
-***
+**Explanation:** Each client gets a connection that the backend can push updates to.
 
-# Editing this README
+#### b) **ChatController.java** – WebSocket chat
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+* Receives messages at `/app/chat.send`.
+* Converts `ChatMessageDTO` to `ChatMessage` entity.
+* Stores the message and broadcasts to `/topic/messages`.
 
-## Suggestions for a good README
+```java
+@Controller
+@AllArgsConstructor
+public class ChatController {
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+    private final ChatService chatService;
+    private final ChatMessageMapper mapper;
 
-## Name
-Choose a self-explaining name for your project.
+    @MessageMapping("/chat.send")
+    @SendTo("/topic/messages")
+    public ChatMessageDTO sendMessage(ChatMessageDTO chatMessageDTO) {
+        chatMessageDTO.setTimestamp(LocalDateTime.now());
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+        ChatMessage message = mapper.toEntity(chatMessageDTO);
+        chatService.addMessage(message);
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+        return mapper.toDTO(message);
+    }
+}
+```
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+**Explanation:** Handles real-time chat messaging and separates API from internal logic.
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+### 3. DTOs (`dto`)
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+#### ChatMessageDTO.java
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+* Represents chat messages sent between frontend and backend.
+* Fields: `sender`, `content`, `timestamp`.
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+```java
+@Getter
+@Setter
+@AllArgsConstructor
+@NoArgsConstructor
+public class ChatMessageDTO {
+    private String sender;
+    private String content;
+    private LocalDateTime timestamp;
+}
+```
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+**Why:** Protects internal model and simplifies API communication.
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+### 4. Mapper (`mapper`)
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+#### ChatMessageMapper.java
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+* Converts between `ChatMessageDTO` and `ChatMessage`.
+* Uses MapStruct for automatic mapping.
 
-## License
-For open source projects, say how it is licensed.
+```java
+@Mapper(componentModel = "spring", unmappedTargetPolicy = ReportingPolicy.IGNORE)
+public interface ChatMessageMapper {
+    ChatMessageDTO toDTO(ChatMessage entity);
+    ChatMessage toEntity(ChatMessageDTO dto);
+}
+```
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+**Explanation:** Keeps conversion logic clean and separate from controllers.
+
+### 5. Models (`model`)
+
+#### ChatMessage.java
+
+* Internal representation of a chat message.
+* Fields: `sender`, `content`, `timestamp`.
+
+```java
+@Getter
+@Setter
+@AllArgsConstructor
+@NoArgsConstructor
+public class ChatMessage {
+    private String sender;
+    private String content;
+    private LocalDateTime timestamp;
+}
+```
+
+**Why:** Serves as the main domain object for storing and processing chat messages.
+
+### 6. Services (`service`)
+
+#### a) **SseService.java** – manages SSE
+
+* Holds a list of `SseEmitter` instances.
+* Sends events to all connected clients.
+* Handles timeouts, errors, and completed connections.
+
+```java
+@Slf4j
+@Service
+public class SseService {
+
+    private final List<SseEmitter> emitters = new CopyOnWriteArrayList<>();
+
+    public SseEmitter createEmitter() {
+        SseEmitter emitter = new SseEmitter(Long.MAX_VALUE);
+        emitters.add(emitter);
+
+        emitter.onCompletion(() -> emitters.remove(emitter));
+        emitter.onTimeout(() -> emitters.remove(emitter));
+        emitter.onError(error -> emitters.remove(emitter));
+
+        return emitter;
+    }
+
+    public void sendTimeUpdate() {
+        String time = LocalTime.now().toString();
+        sendEvent("time-update", time);
+    }
+
+    private void sendEvent(String eventName, Object data) {
+        for (SseEmitter emitter : emitters) {
+            try {
+                emitter.send(SseEmitter.event().name(eventName).data(data));
+            } catch (IOException e) {
+                emitter.complete();
+                emitters.remove(emitter);
+            }
+        }
+    }
+
+    public int getActiveEmittersCount() {
+        return emitters.size();
+    }
+}
+```
+
+**Explanation:** Centralizes SSE logic for easier management and reliability.
+
+#### b) **ChatService.java** – chat storage
+
+* Stores messages in memory.
+* Logs new messages.
+
+```java
+@Slf4j
+@Service
+public class ChatService {
+
+    private final List<ChatMessage> messageHistory = new ArrayList<>();
+
+    public void addMessage(ChatMessage message) {
+        messageHistory.add(message);
+        log.info("New chat message from {}: {}", message.getSender(), message.getContent());
+    }
+}
+```
+
+**Explanation:** Decouples message storage from controllers, keeping code clean.
+
+---
+
+## Summary
+
+* **SSE**: pushes server time every 5 seconds.
+* **WebSocket chat**: real-time messaging between clients.
+* **Layered architecture**: Config → Controller → Service → Model/DTO/Mapper.
+* **DTOs & Mapper**: separate API from domain model.
+* **Logging**: provides visibility into message flow and active clients.
